@@ -1,6 +1,7 @@
 import pandas as pd
 import cohere
 import os
+import time
 from dotenv import load_dotenv
 import streamlit as st
 from nutrition_parser import load_foundation_foods
@@ -16,12 +17,16 @@ def load_exercise_data(csv_file):
     return df 
 
 exercise_data = load_exercise_data('megaGymDataset.csv') 
-foods = load_foundation_foods("data/foundation.json")
 
-# --- Clean nutrition data ---
-nutrition_data = nutrition_data[["Food_Item", "Category", "Calories (kcal)",
-                                 "Protein (g)", "Carbohydrates (g)", "Fat (g)", "Fiber (g)"
-                                 ]].drop_duplicates().reset_index(drop=True)
+# --- Nutrition Data Loading ---
+@st.cache_data
+def load_nutrition_data():
+    return pd.read_parquet("data/foundation.parquet")
+
+# --- Load nutrition data with spinner ---
+with st.spinner("Loading food nutrition data... hang tight!"):
+    nutrition_data = load_nutrition_data()
+
 
 # --- recommendation function ---
 def recommend_foods(goal, food_data, top_n=10):
@@ -78,7 +83,6 @@ def food_macro_contribution(food):
         "Protein (g)": food["Protein (g)"],
         "Carbs (g)": food["Carbohydrates (g)"],
         "Fat (g)": food["Fat (g)"],
-        "Fiber (g)": food["Fiber (g)"]
     }
 
 # --- User Preferences ---
@@ -91,52 +95,66 @@ def gather_user_preferences():
     restrictions = st.checkbox("Any injuries or limitations?")
     return goal, experience, weight, restrictions
 
-# --- Prompt Helper ---
-def craft_fitness_prompt(query, exercise_data, weight, macros):
+# New: Filter exercises based on goal and experience
+def filter_exercises(exercise_data, goal, experience):
+    # Map fitness goals to exercise types or body parts (customize as needed)
+    goal_map = {
+        "Build Muscle": ["Strength", "Hypertrophy"],
+        "Weight Loss": ["Cardio", "HIIT"],
+        "Endurance": ["Cardio", "Endurance"],
+        "General Fitness": ["Strength", "Cardio", "Flexibility"]
+    }
+    exp_levels = {
+        "Beginner": ["Beginner"],
+        "Intermediate": ["Beginner", "Intermediate"],
+        "Advanced": ["Beginner", "Intermediate", "Advanced"]
+    }
+
+    filtered = exercise_data[
+        (exercise_data["Type"].isin(goal_map.get(goal, []))) &
+        (exercise_data["Level"].isin(exp_levels.get(experience, [])))
+    ]
+
+    # Return top 5 exercises as a sample
+    return filtered.head(5)
+
+# Modify craft_fitness_prompt to include exercise summary
+def craft_fitness_prompt(query, weight, macros, filtered_exercises):
+    exercise_list_text = "\n".join(
+        [f"- {row['Title']}: {row['Desc']}" for _, row in filtered_exercises.iterrows()]
+    )
     return (
-        f"You know all the core principles of fitness nutrition:\n"
-        "- Protein target = 1.0–1.5g per lb of bodyweight for muscle gain\n"
-        "- Calorie maintenance = ~15 cal per lb of bodyweight\n"
-        "- Macro splits depend on goal:\n"
-        "  • Build Muscle = ~35% protein, 45% carbs, 20% fat\n"
-        "  • Weight Loss = higher protein, lower carbs\n"
-        "- Always give realistic, evidence-based advice — but with sass and roasts.\n"
-        "- Never give meal plans that go under 1400 calories.\n\n"
-        f"The user asked: '{query}'\n"
-        f"They weigh {weight} lbs.\n"
-        f"Estimated daily targets:\n"
+        f"You are a snarky but accurate fitness coach. Always base your advice on science and user's goals.\n\n"
+        f"User weight: {weight} lbs\n"
+        f"Daily macro targets:\n"
         f"• Calories: {macros['calories']} kcal\n"
         f"• Protein: {macros['protein']} g\n"
         f"• Carbs: {macros['carbs']} g\n"
         f"• Fat: {macros['fat']} g\n\n"
-        "You have access to a dataset where each exercise has:\n"
-        "- Title (name)\n"
-        "- Description (how to perform it)\n"
-        "- Type (e.g., Strength, Cardio)\n"
-        "- Body part (e.g., Legs, Arms)\n"
-        "- Equipment required (if any)\n"
-        "- Difficulty level (Beginner, Intermediate, Advanced)\n"
-        "Be creative and roast them while giving advice. Don’t explain the dataset structure, just use it.\n"
+        "Recommended exercises for the user based on their goal and experience:\n"
+        f"{exercise_list_text}\n\n"
+        "Don't explain datasets. Give tough love. Be funny but informative. No fluff. Never give a meal plan under 1400 kcal.\n"
     )
 
-# --- Process Chat Query ---
-def process_query(query, exercise_data, user_preferences):
-    goal, experience, weight, restrictions = user_preferences
-    macros = calculate_macros(weight, goal)
-    history = "".join([f"User: {chat['user']}\nBot: {chat['bot']}\n" for chat in st.session_state.chat_history])
-
-    prompt = (
-        f"{history}\nUser: {query}\n"
-        f"{craft_fitness_prompt(query, exercise_data, weight, macros)}"
-    )
+# Update process_query to accept user preferences and incorporate exercise filtering
+def process_query(user_input, chat, weight, macros, goal, experience):
+    filtered_exercises = filter_exercises(exercise_data, goal, experience)
+    full_chat = [
+        {"role": "SYSTEM", "message": craft_fitness_prompt("", weight, macros, filtered_exercises)},
+    ]
+    if chat:
+        full_chat.extend([
+            {"role": "USER", "message": chat["user"]},
+            {"role": "CHATBOT", "message": chat["bot"]},
+        ])
 
     response = co.chat(
-        model='command-nightly',
-        message=prompt,
-        temperature=0.7
+        model="command-nightly",
+        chat_history=full_chat,
+        message=user_input,
+        temperature=0.7,
     )
-
-    return response.text.strip()
+    return response.text
 
 # --- Pagination Helper Functions ---
 
@@ -171,7 +189,15 @@ user_input = st.text_input("Ask me about workouts or fitness...")
 
 if st.button("Submit"): 
     if user_input and user_preferences:
-        chatbot_response = process_query(user_input, exercise_data, user_preferences)
+        with st.spinner("Thinking super hard..."):
+            chatbot_response = process_query(
+                user_input,
+                st.session_state.chat_history[-1] if st.session_state.chat_history else None,
+                weight,
+                macros,
+                goal,
+                user_preferences[1]  # experience
+            )
         st.session_state.chat_history.append({
             "user": user_input,
             "bot": chatbot_response
@@ -187,7 +213,7 @@ if st.session_state.chat_history:
     st.write(f"**User:** {chat['user']}")
     st.write(f"**Bot:** {chat['bot']}")
 
-    st.markdown("### 🍱 Food Suggestions Based on Your Goal")
+    st.markdown("### Food Suggestions Based on Your Goal")
     food_df = recommend_foods(goal, nutrition_data)
     contrib_list = []
     for _, row in food_df.iterrows():
